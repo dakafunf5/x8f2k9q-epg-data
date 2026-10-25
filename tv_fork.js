@@ -490,6 +490,10 @@ function pluginPage(object) {
 	EPG = {};
 	var epgIdCurrent = '';
 	var epgPath = '';
+	/* FORK: chIDs was previously declared inside setEpgId(); it is still
+	 * referenced by parseList, so declare it here. Without this, strict mode
+	 * throws "chIDs is not defined" when the playlist finishes loading. */
+	var chIDs = {id2epg: {}, piconUrl: '', id2picon: []};
 	var favorite = getStorage('favorite' + object.id, '[]');
 	var network = new Lampa.Reguest();
 	var scroll = new Lampa.Scroll({
