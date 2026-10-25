@@ -488,6 +488,8 @@ function pluginPage(object) {
 		curListId = object.id;
 	}
 	EPG = {};
+	var epgUpdating = {}; /* FORK: re-entrancy guard, see epgUpdateData */
+	var epgIdChannelMap = {}; /* FORK: epgId -> channel object */
 	var epgIdCurrent = '';
 	var epgPath = '';
 	/* FORK: chIDs was previously declared inside setEpgId(); it is still
@@ -859,38 +861,12 @@ function pluginPage(object) {
 		return null;
 	}
 
-	function epgUpdateData(epgId) {
-		/* FORK: data comes from the locally parsed XMLTV, not epg.rootu.top. */
-		var lt = Math.floor(unixtime() / 60);
-
-		if (!EPG[epgId]) EPG[epgId] = [Math.floor(lt / 60), Math.floor(lt / 60), []];
-
-		var ch = channelByEpgId(epgId);
-		var list = ch ? xmltvForChannel(ch) : null;
-
-		if (!list || !list.length) {
-			EPG[epgId][2] = [];
-			epgRender(epgId);
-			return;
-		}
-
-		// Feed the renderer only what is still upcoming, like upstream did.
-		/* FORK: keep everything from ~1h ago onward so the panel can show
-		 * both "Сейчас" and a long "Потом" list. */
-		var out = [], i;
-		for (i = 0; i < list.length; i++) {
-			if (lt < (list[i][0] + list[i][1]) + 60) out.push(list[i]);
-		}
-		EPG[epgId][2] = out;
-		EPG[epgId][1] = Math.floor(lt / 60) + 48;
-		epgRender(epgId);
-	}
-
-	/** Find the channel object that carries a given epgId. */
-	var epgIdChannelMap = {};
+	/** Find the channel object that carries a given epgId.
+	 *  FORK: restored after being lost in an earlier edit. */
 	function channelByEpgId(epgId) {
 		if (epgIdChannelMap[epgId]) return epgIdChannelMap[epgId];
 		for (var g in catalog) {
+			if (!catalog[g] || !catalog[g].channels) continue;
 			var chs = catalog[g].channels;
 			for (var i = 0; i < chs.length; i++) {
 				if (chs[i]['epgId'] === epgId) {
@@ -900,6 +876,54 @@ function pluginPage(object) {
 			}
 		}
 		return null;
+	}
+
+	function epgUpdateData(epgId) {
+		/* FORK: data comes from the locally parsed XMLTV, not epg.rootu.top.
+		 *
+		 * IMPORTANT: this is synchronous, unlike upstream's async fetch.
+		 * epgRender() calls back into epgUpdateData() when its list is short,
+		 * so without a guard this recurses forever ("Maximum call stack size
+		 * exceeded"). Two guards:
+		 *   1. epgUpdating[id]  — re-entrancy latch
+		 *   2. data already present and fresh — early return, like upstream
+		 */
+		if (epgUpdating[epgId]) return;
+
+		var lt = Math.floor(unixtime() / 60);
+
+		// Already populated and still valid? Nothing to do.
+		if (EPG[epgId] && EPG[epgId][2] && EPG[epgId][2].length >= 3) {
+			EPG[epgId][1] = Math.floor(lt / 60) + 48;
+			return;
+		}
+
+		epgUpdating[epgId] = true;
+		try {
+			if (!EPG[epgId]) EPG[epgId] = [Math.floor(lt / 60), Math.floor(lt / 60), []];
+
+			var ch = channelByEpgId(epgId);
+			var list = ch ? xmltvForChannel(ch) : null;
+
+			if (!list || !list.length) {
+				EPG[epgId][2] = [];
+				epgRender(epgId);
+				return;
+			}
+
+			/* Keep everything from ~1h ago onward so the panel can show both
+			 * "Сейчас" and a long "Потом" list. */
+			var out = [], i;
+			for (i = 0; i < list.length; i++) {
+				if (lt < (list[i][0] + list[i][1]) + 60) out.push(list[i]);
+			}
+			EPG[epgId][2] = out;
+			EPG[epgId][1] = Math.floor(lt / 60) + 48;
+
+			epgRender(epgId);
+		} finally {
+			epgUpdating[epgId] = false;
+		}
 	}
 
 	function cardsEpgRender(cards) {
