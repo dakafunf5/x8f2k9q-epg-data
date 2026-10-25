@@ -187,6 +187,16 @@
     var manual = S.get('epg_url', '');
     if (manual) urls.push(manual);
 
+    // IPTV Custom (component "my_iptv") stores each playlist slot as
+    //   my_iptv_list_url_<n>   — verified against plugin source lines 1819/1843.
+    try {
+      for (var n = 0; n < 10; n++) {
+        var v = Lampa.Storage.get('my_iptv_list_url_' + n, '');
+        if (v && typeof v === 'string' && /^https?:\/\//i.test(v)) urls.push(v);
+      }
+    } catch (e) {}
+
+    // Older / alternative key shapes, just in case.
     try {
       var raw = Lampa.Storage.get('my_iptv_lists', '[]');
       var lists = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -252,6 +262,7 @@
         for (var k in guide) n += guide[k].length;
         log('parsed', n, 'programmes for', Object.keys(guide).length, 'channels');
         guideState = 'ready';
+        try { preferChannelsWithGuide(); } catch (e) {}
         drain(null, guide);
       }, 45000);
     });
@@ -389,11 +400,7 @@
           pendingId = idm ? idm[1] : null;
           var nm = line.indexOf(',') >= 0 ? line.slice(line.lastIndexOf(',') + 1) : '';
           if (pendingId && nm) {
-            // strip the leading "12. " numbering and quality suffixes
-            var clean = nm.replace(/^\s*\d+\.\s*/, '')
-              .replace(/\s*\[[^\]]*\]/g, '')
-              .replace(/\s*·\s*server\s*\d+\s*$/i, '')
-              .trim().toLowerCase();
+            var clean = normTitle(nm);
             if (clean && !map[clean]) map[clean] = pendingId;
           }
         }
@@ -404,22 +411,91 @@
     }, 15000);
   }
 
+  /**
+   * Normalise a channel title for matching.
+   * IPTV Custom shows `channel.Title` verbatim from #EXTINF — no "3. " prefix
+   * (verified: plugin line 958 `info.find('.info__title').text(channel.Title)`),
+   * so we must match the raw name, minus quality/server suffixes.
+   */
+  function normTitle(s) {
+    return String(s || '')
+      .replace(/^\s*\d+\.\s*/, '')          // leading "3. " numbering, if present
+      .replace(/\[[^\]]*\]/g, '')           // [1920x1080]
+      .replace(/·\s*server\s*\d+\s*/gi, '') // · server 2
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
   function learnChannel() {
-    // Look for the detail card's title element and map it back to a tvg-id.
-    var titleEl = document.querySelector('.info__title');
-    if (!titleEl) return;
-    var raw = (titleEl.textContent || '').replace(/^\s*\d+\.\s*/, '').trim();
-    var norm = raw.replace(/\s*\[[^\]]*\]/g, '').replace(/\s*·\s*server\s*\d+\s*$/i, '').trim().toLowerCase();
+    // Primary source: the info panel title that IPTV Custom fills on focus.
+    var el = document.querySelector('.info__title') ||
+             document.querySelector('[data-lampa-epg-id]');
+    if (!el) return;
+
+    var raw = (el.getAttribute && el.getAttribute('data-lampa-epg-id')) || el.textContent || '';
+    var norm = normTitle(raw);
     if (!norm) return;
+    if (S.get('last_tvg_title', '') === norm) return; // already resolved
+
     buildTitleIndex(function (map) {
       if (!map) return;
       var id = map[norm];
-      if (id) {
-        S.set('last_tvg', id);
-        log('channel ->', raw, '=>', id);
-        patchPanel();
+      if (!id) {
+        // Try a looser pass: strip common HD/quality markers.
+        var loose = norm.replace(/\b(hd|fhd|uhd|4k|sd)\b/g, '').replace(/\s+/g, ' ').trim();
+        id = map[loose];
       }
+      if (!id) {
+        S.set('last_tvg_title', norm);
+        log('channel unresolved:', raw);
+        return;
+      }
+      S.set('last_tvg_title', norm);
+      S.set('last_tvg', id);
+      log('channel ->', raw, '=>', id);
+      patchPanel();
     });
+  }
+
+  /**
+   * Re-point the index at whichever tvg-id actually has guide data.
+   * Playlists often list one channel 3x ("· server 1/2/3") with the same
+   * display name but different quality variants; the first mapping wins, which
+   * may be a variant whose tvg-id has no programmes. Rebuild once the guide is
+   * loaded so matching prefers channels we can actually describe.
+   */
+  function preferChannelsWithGuide() {
+    if (!titleToId || !guide) return;
+    // Re-scan the playlist, collecting ALL ids per normalised title.
+    var urls = findListUrls();
+    if (!urls.length) return;
+    fetchText(urls[0], function (err, text) {
+      if (err || !text) return;
+      var byTitle = Object.create(null);
+      var lines = text.split(/\r?\n/);
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (line.indexOf('#EXTINF') !== 0) continue;
+        var idm = /tvg-id="([^"]*)"/.exec(line);
+        if (!idm) continue;
+        var nm = line.indexOf(',') >= 0 ? line.slice(line.lastIndexOf(',') + 1) : '';
+        var key = normTitle(nm);
+        if (!key) continue;
+        (byTitle[key] || (byTitle[key] = [])).push(idm[1]);
+      }
+      var improved = 0;
+      for (var k in byTitle) {
+        var ids = byTitle[k];
+        if (ids.length < 2) continue;
+        var withData = ids.filter(function (x) { return guide[x] && guide[x].length; });
+        if (withData.length && titleToId[k] !== withData[0]) {
+          titleToId[k] = withData[0];
+          improved++;
+        }
+      }
+      log('index re-pointed to guide-bearing ids:', improved);
+    }, 15000);
   }
 
   /* ---------- observe UI ---------- */
