@@ -1,0 +1,61 @@
+name: Update EPG
+
+# Schedule rationale (read this before changing the cron):
+#
+# The upstream guide (epg.one) publishes only ~1-2 days of FULL listings ahead;
+# beyond that it has partial days (Oct 26: ~770 programmes, Oct 27: ~300, then
+# almost nothing). Measured on 2026-10-25.
+#
+# So the guide must be rebuilt roughly DAILY to stay populated. A weekly run
+# would leave the guide blank for ~5 of every 7 days.
+#
+# 06:10 UTC daily = 09:10 MSK. Upstream regenerates around 05:44 UTC, so this
+# runs comfortably after the new data lands.
+on:
+  schedule:
+    - cron: '10 6 * * *'
+  workflow_dispatch: {} # lets you trigger it by hand from the Actions tab
+
+permissions:
+  contents: write # needed to commit epg_merged.xml back to the repo
+
+concurrency:
+  group: update-epg
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate EPG
+        run: python generate_epg.py
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          test -s epg_merged.xml || { echo "epg_merged.xml missing/empty"; exit 1; }
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add epg_merged.xml
+          if git diff --staged --quiet; then
+            echo "No changes to epg_merged.xml"
+          else
+            git commit -m "EPG update $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
+
+      - name: Summary
+        run: |
+          echo "### EPG updated" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -c '<programme' epg_merged.xml | sed 's/^/programmes: /' >> $GITHUB_STEP_SUMMARY || true
+          grep -c '<channel id=' epg_merged.xml | sed 's/^/channels:   /' >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
