@@ -314,61 +314,6 @@
    *   .js-epgAfter .js-epgList   upcoming list
    * When its own EPG fails, these stay empty or hidden. We refill them.
    */
-  function currentTvgId() {
-    // The card title in IPTV Custom is "N. <channel name>"; the reliable
-    // source is the active activity's item, or a data attribute we set.
-    var el = document.querySelector('[data-lampa-epg-id]');
-    if (el) return el.getAttribute('data-lampa-epg-id');
-    return S.get('last_tvg', '') || null;
-  }
-
-  function patchPanel() {
-    var panel = document.querySelector('#my_iptv_epg, [id$="_epg"]');
-    if (!panel) return;
-    var tvgId = currentTvgId();
-    if (!tvgId) return;
-
-    var nn = nowNext(tvgId);
-    if (!nn) return;
-
-    var q = function (sel) { return panel.querySelector(sel); };
-
-    var nowBox = q('.js-epgNow');
-    if (nowBox && nn.cur) {
-      var total = Math.max(1, nn.cur.e - nn.cur.s);
-      var pct = Math.round((Date.now() - nn.cur.s) * 100 / total);
-      var timeEl = nowBox.querySelector('.js-epgTime');
-      var titleEl = nowBox.querySelector('.js-epgTitle');
-      var progEl = nowBox.querySelector('.js-epgProgress');
-      var descEl = nowBox.querySelector('.js-epgDesc');
-      if (timeEl) timeEl.textContent = hhmm(nn.cur.s);
-      if (titleEl) titleEl.textContent = nn.cur.t;
-      if (progEl) progEl.style.width = Math.max(0, Math.min(100, pct)) + '%';
-      if (descEl && nn.cur.d) descEl.textContent = nn.cur.d;
-      nowBox.style.display = '';
-    }
-
-    var afterBox = q('.js-epgAfter');
-    var listEl = afterBox && afterBox.querySelector('.js-epgList');
-    if (listEl) {
-      var list = programmesFor(tvgId) || [];
-      var nowMs = Date.now();
-      var upcoming = list.filter(function (p) { return p.s > nowMs; }).slice(0, 8);
-      if (upcoming.length) {
-        var html = '';
-        for (var i = 0; i < upcoming.length; i++) {
-          var p = upcoming[i];
-          html += '<div class="lampa-epg-item">'
-            + '<div class="lampa-epg-time">' + hhmm(p.s) + '</div>'
-            + '<div class="lampa-epg-title">' + escapeHtml(p.t) + '</div>'
-            + '</div>';
-        }
-        listEl.innerHTML = html;
-        if (afterBox) afterBox.style.display = '';
-      }
-    }
-  }
-
   function escapeHtml(s) {
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -427,37 +372,6 @@
       .toLowerCase();
   }
 
-  function learnChannel() {
-    // Primary source: the info panel title that IPTV Custom fills on focus.
-    var el = document.querySelector('.info__title') ||
-             document.querySelector('[data-lampa-epg-id]');
-    if (!el) return;
-
-    var raw = (el.getAttribute && el.getAttribute('data-lampa-epg-id')) || el.textContent || '';
-    var norm = normTitle(raw);
-    if (!norm) return;
-    if (S.get('last_tvg_title', '') === norm) return; // already resolved
-
-    buildTitleIndex(function (map) {
-      if (!map) return;
-      var id = map[norm];
-      if (!id) {
-        // Try a looser pass: strip common HD/quality markers.
-        var loose = norm.replace(/\b(hd|fhd|uhd|4k|sd)\b/g, '').replace(/\s+/g, ' ').trim();
-        id = map[loose];
-      }
-      if (!id) {
-        S.set('last_tvg_title', norm);
-        log('channel unresolved:', raw);
-        return;
-      }
-      S.set('last_tvg_title', norm);
-      S.set('last_tvg', id);
-      log('channel ->', raw, '=>', id);
-      patchPanel();
-    });
-  }
-
   /**
    * Re-point the index at whichever tvg-id actually has guide data.
    * Playlists often list one channel 3x ("· server 1/2/3") with the same
@@ -500,19 +414,136 @@
 
   /* ---------- observe UI ---------- */
 
-  function startObserver() {
-    var obs = new MutationObserver(function () {
-      try {
-        learnChannel();
-        patchPanel();
-      } catch (e) {}
+  /**
+   * Cheap, event-driven patching.
+   *
+   * The old version observed the whole document and ran learnChannel() +
+   * patchPanel() on EVERY mutation. IPTV Custom renders channels in batches
+   * (bulkWrapper), so entering the TV section fires hundreds of mutations;
+   * patchPanel() itself mutates the DOM, which re-triggered the observer —
+   * a feedback loop that froze the app.
+   *
+   * Now: mutations only schedule a debounced check, the check is O(1) when the
+   * panel isn't present, and we never write to the DOM unless a value actually
+   * changes.
+   */
+
+  var scheduled = false;
+  var lastSig = '';
+
+  function schedule(delay) {
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(function () {
+      scheduled = false;
+      tick();
+    }, delay || 250);
+  }
+
+  function tick() {
+    var panel = document.querySelector('#my_iptv_epg, [id$="_epg"]');
+    if (!panel) return;                       // not on a channel detail screen
+    var infoEl = document.querySelector('.info__title');
+    if (!infoEl) return;
+
+    // Lazily load only once the panel truly exists — never during card
+    // rendering, which is where the freeze happened.
+    if (!guide) {
+      ensureTitleIndex();
+      if (guideState === 'idle') loadGuide(function () { schedule(0); });
+      return;
+    }
+
+    var raw = infoEl.textContent || '';
+    var id = resolveId(raw);
+    if (!id) return;
+
+    var nn = nowNext(id);
+    if (!nn) return;
+
+    // Only touch the DOM when the displayed programme identity changes.
+    var sig = id + '|' + (nn.cur ? nn.cur.s : 0);
+    if (sig === lastSig) return;
+    lastSig = sig;
+
+    paint(panel, nn, id);
+  }
+
+  var idCache = Object.create(null);
+  function resolveId(raw) {
+    var norm = normTitle(raw);
+    if (!norm) return null;
+    if (idCache[norm] !== undefined) return idCache[norm];
+    if (!titleToId) { ensureTitleIndex(); return null; }
+    var id = titleToId[norm];
+    if (!id) {
+      var loose = norm.replace(/\b(hd|fhd|uhd|4k|sd)\b/g, '').replace(/\s+/g, ' ').trim();
+      id = titleToId[loose] || null;
+    }
+    idCache[norm] = id;
+    if (id) log('channel ->', raw, '=>', id);
+    else log('channel unresolved:', raw);
+    return id;
+  }
+
+  var indexRequested = false;
+  function ensureTitleIndex() {
+    if (indexRequested) return;
+    indexRequested = true;
+    buildTitleIndex(function (map) {
+      if (map) { idCache = Object.create(null); schedule(100); }
     });
+  }
+
+  function paint(panel, nn, tvgId) {
+    var q = function (sel) { return panel.querySelector(sel); };
+
+    if (nn.cur) {
+      var nowBox = q('.js-epgNow');
+      if (nowBox) {
+        var total = Math.max(1, nn.cur.e - nn.cur.s);
+        var pct = Math.max(0, Math.min(100, Math.round((Date.now() - nn.cur.s) * 100 / total)));
+        var tEl = nowBox.querySelector('.js-epgTime');
+        var tiEl = nowBox.querySelector('.js-epgTitle');
+        var prEl = nowBox.querySelector('.js-epgProgress');
+        var deEl = nowBox.querySelector('.js-epgDesc');
+        if (tEl) tEl.textContent = hhmm(nn.cur.s);
+        if (tiEl) tiEl.textContent = nn.cur.t;
+        if (prEl) prEl.style.width = pct + '%';
+        if (deEl && nn.cur.d) deEl.textContent = nn.cur.d;
+        if (nowBox.style.display === 'none') nowBox.style.display = '';
+      }
+    }
+
+    var listEl = panel.querySelector('.js-epgList');
+    if (listEl) {
+      var list = programmesFor(tvgId) || [];
+      var nowMs = Date.now();
+      var upcoming = [];
+      for (var i = 0; i < list.length && upcoming.length < 8; i++) {
+        if (list[i].s > nowMs) upcoming.push(list[i]);
+      }
+      if (upcoming.length) {
+        listEl.innerHTML = upcoming.map(function (p) {
+          return '<div style="display:flex;gap:1em;padding:.15em 0">'
+            + '<span class="js-epgTime">' + hhmm(p.s) + '</span>'
+            + '<span>' + escapeHtml(p.t) + '</span></div>';
+        }).join('');
+      }
+    }
+    log('painted', tvgId, nn.cur ? nn.cur.t : '(no current)');
+  }
+
+  function startObserver() {
+    var obs = new MutationObserver(function () { schedule(300); });
+    // Observe only childList at the top of body: cheap, and enough to notice
+    // a screen change. Never observe attributes or characterData.
     obs.observe(document.body, { childList: true, subtree: true });
 
-    // Periodic refresh keeps the progress bar honest.
-    setInterval(function () {
-      try { patchPanel(); } catch (e) {}
-    }, 30000);
+    // Refresh progress occasionally; also re-paint when the programme changes.
+    setInterval(function () { lastSig = ''; schedule(0); }, 60000);
+
+    // Nothing is fetched until a channel panel actually opens (see tick()).
   }
 
   /* ---------- settings ---------- */
@@ -560,9 +591,6 @@
     log('v' + VERSION + ' start');
     addSettings();
     startObserver();
-
-    // Warm the guide in the background so the first card is instant.
-    setTimeout(function () { loadGuide(function () {}); }, 3000);
   }
 
   if (window.appready) boot();
